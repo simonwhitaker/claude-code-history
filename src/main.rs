@@ -42,6 +42,14 @@ struct Cli {
     list: bool,
 
     #[arg(
+        short = 'q',
+        long = "search",
+        value_name = "QUERY",
+        help = "Search session transcripts for a query"
+    )]
+    search: Option<String>,
+
+    #[arg(
         short = 's',
         long = "choose-session",
         help = "Choose which recent session to display"
@@ -64,6 +72,7 @@ struct SessionSummary {
     path: PathBuf,
     modified_at: DateTime<Local>,
     first_prompt: String,
+    searchable_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -88,8 +97,21 @@ fn run() -> Result<()> {
         bail!("No Claude history found for this workspace");
     }
 
-    let mut sessions = collect_sessions(&project_dir)?;
-    if sessions.is_empty() {
+    let mut sessions = collect_sessions(
+        &project_dir,
+        if cli.search.is_some() {
+            None
+        } else {
+            Some(SESSION_LIMIT)
+        },
+    )?;
+
+    if let Some(query) = cli.search.as_deref() {
+        sessions.retain(|session| session_matches_query(session, query));
+        if sessions.is_empty() {
+            bail!("No matching sessions found.");
+        }
+    } else if sessions.is_empty() {
         bail!("No session files found in the Claude project directory.");
     }
 
@@ -97,7 +119,9 @@ fn run() -> Result<()> {
         return print_session_list(&sessions);
     }
 
-    let session = if cli.choose_session {
+    let should_choose_match =
+        cli.search.is_some() && sessions.len() > 1 && terminal_is_interactive();
+    let session = if cli.choose_session || should_choose_match {
         choose_session(&sessions)?
     } else {
         sessions.remove(0)
@@ -254,7 +278,7 @@ fn session_cwd(data: &Value) -> Option<&str> {
     data.get("cwd").and_then(Value::as_str)
 }
 
-fn collect_sessions(project_dir: &Path) -> Result<Vec<SessionSummary>> {
+fn collect_sessions(project_dir: &Path, limit: Option<usize>) -> Result<Vec<SessionSummary>> {
     let mut sessions = Vec::new();
 
     for entry in project_dir
@@ -272,7 +296,9 @@ fn collect_sessions(project_dir: &Path) -> Result<Vec<SessionSummary>> {
     }
 
     sessions.sort_by_key(|session| Reverse(session.modified_at));
-    sessions.truncate(SESSION_LIMIT);
+    if let Some(limit) = limit {
+        sessions.truncate(limit);
+    }
     Ok(sessions)
 }
 
@@ -288,6 +314,7 @@ fn session_summary(path: &Path) -> Result<SessionSummary> {
 
     let reader = open_jsonl(path)?;
     let mut first_prompt = String::from("Unknown");
+    let mut searchable_parts = Vec::new();
 
     for line in reader.lines() {
         let line = line.with_context(|| format!("failed to read {}", path.display()))?;
@@ -297,8 +324,15 @@ fn session_summary(path: &Path) -> Result<SessionSummary> {
         if is_message(&data)
             && let Some(content) = message_content(&data)
         {
-            first_prompt = collapse_newlines(content.trim());
-            break;
+            let content = content.trim();
+            if first_prompt == "Unknown" && !content.is_empty() {
+                first_prompt = collapse_newlines(content);
+            }
+
+            let normalized = normalize_for_search(content);
+            if !normalized.is_empty() {
+                searchable_parts.push(normalized);
+            }
         }
     }
 
@@ -306,6 +340,7 @@ fn session_summary(path: &Path) -> Result<SessionSummary> {
         path: path.to_path_buf(),
         modified_at,
         first_prompt,
+        searchable_text: searchable_parts.join(" "),
     })
 }
 
@@ -529,12 +564,117 @@ fn quote_markdown(text: &str, use_color: bool) -> String {
     quoted
 }
 
+fn terminal_is_interactive() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn session_matches_query(session: &SessionSummary, query: &str) -> bool {
+    matches_search_text(&session.searchable_text, query)
+}
+
+fn matches_search_text(haystack: &str, query: &str) -> bool {
+    let normalized_query = normalize_for_search(query);
+    if normalized_query.is_empty() {
+        return true;
+    }
+
+    if haystack.contains(&normalized_query) {
+        return true;
+    }
+
+    let haystack_tokens = haystack.split_whitespace().collect::<Vec<_>>();
+    let query_tokens = normalized_query
+        .split_whitespace()
+        .filter(|token| token.len() > 1)
+        .collect::<Vec<_>>();
+
+    if query_tokens.is_empty() {
+        return false;
+    }
+
+    query_tokens.iter().all(|query_token| {
+        haystack_tokens
+            .iter()
+            .any(|token| token_matches(token, query_token))
+    })
+}
+
+fn token_matches(haystack_token: &str, query_token: &str) -> bool {
+    haystack_token.contains(query_token)
+        || query_token.contains(haystack_token)
+        || within_one_edit(haystack_token, query_token)
+}
+
+fn within_one_edit(left: &str, right: &str) -> bool {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+
+    match left.len().abs_diff(right.len()) {
+        0 => {
+            left.iter()
+                .zip(right.iter())
+                .filter(|(left, right)| left != right)
+                .count()
+                <= 1
+        }
+        1 => {
+            let (shorter, longer) = if left.len() < right.len() {
+                (&left, &right)
+            } else {
+                (&right, &left)
+            };
+            let mut short_index = 0;
+            let mut long_index = 0;
+            let mut skipped = false;
+
+            while short_index < shorter.len() && long_index < longer.len() {
+                if shorter[short_index] == longer[long_index] {
+                    short_index += 1;
+                    long_index += 1;
+                    continue;
+                }
+
+                if skipped {
+                    return false;
+                }
+
+                skipped = true;
+                long_index += 1;
+            }
+
+            true
+        }
+        _ => false,
+    }
+}
+
+fn normalize_for_search(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut previous_was_space = true;
+
+    for ch in text.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_alphanumeric() {
+            normalized.push(ch);
+            previous_was_space = false;
+        } else if !previous_was_space {
+            normalized.push(' ');
+            previous_was_space = true;
+        }
+    }
+
+    if previous_was_space {
+        normalized.pop();
+    }
+
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ANSI_BOLD_BLUE, ANSI_DIM, ANSI_RESET, Cli, claude_project_dir_in_projects,
-        collapse_newlines, format_speaker_heading, format_timestamp, is_message, message_content,
-        quote_markdown, session_cwd,
+        collapse_newlines, format_speaker_heading, format_timestamp, is_message,
+        matches_search_text, message_content, normalize_for_search, quote_markdown, session_cwd,
     };
     use clap::{Parser, error::ErrorKind};
     use serde_json::json;
@@ -696,5 +836,34 @@ mod tests {
         });
 
         assert_eq!(session_cwd(&value), Some("/tmp/example"));
+    }
+
+    #[test]
+    fn normalizes_search_text_case_insensitively() {
+        assert_eq!(normalize_for_search("Serde_JSON v1"), "serde json v1");
+    }
+
+    #[test]
+    fn search_matches_case_insensitive_substrings() {
+        assert!(matches_search_text(
+            "serde is a rust serialization library",
+            "Serde"
+        ));
+    }
+
+    #[test]
+    fn search_matches_words_out_of_order() {
+        assert!(matches_search_text(
+            "serde is a rust serialization library",
+            "library rust serialization"
+        ));
+    }
+
+    #[test]
+    fn search_tolerates_single_character_typos() {
+        assert!(matches_search_text(
+            "serde is a rust serialization library",
+            "serializtion"
+        ));
     }
 }

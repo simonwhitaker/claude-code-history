@@ -28,6 +28,18 @@ To get a list of command-line options:
 claude-history --help
 ```
 
+Search session transcripts for a remembered topic:
+
+```command
+claude-history --search serde
+```
+
+When several sessions match, `claude-history` will prompt you to choose one in an interactive terminal. You can also combine search with `--list` to show matching sessions without opening a transcript:
+
+```command
+claude-history --search "rust serialization library" --list
+```
+
 For release and repository workflow details, see `CONTRIBUTING.md`.
 
 For example:
