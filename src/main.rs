@@ -6,7 +6,7 @@ use std::process;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
-use clap::Parser;
+use clap::{Parser, ValueHint};
 use dialoguer::{Select, theme::ColorfulTheme};
 use serde_json::Value;
 
@@ -47,6 +47,16 @@ struct Cli {
         help = "Choose which recent session to display"
     )]
     choose_session: bool,
+
+    #[arg(
+        short = 'w',
+        long = "workspace",
+        value_name = "PATH",
+        value_hint = ValueHint::DirPath,
+        num_args = 0..=1,
+        help = "Read history for PATH, or prompt to choose when passed without a value"
+    )]
+    workspace: Option<Option<PathBuf>>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +64,12 @@ struct SessionSummary {
     path: PathBuf,
     modified_at: DateTime<Local>,
     first_prompt: String,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceSummary {
+    path: PathBuf,
+    modified_at: DateTime<Local>,
 }
 
 fn main() {
@@ -65,11 +81,11 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    let project_dir = claude_project_dir(&cwd)?;
+    let workspace_dir = resolve_workspace_dir(cli.workspace.as_ref())?;
+    let project_dir = claude_project_dir(&workspace_dir)?;
 
     if !project_dir.exists() {
-        bail!("No Claude history found for this folder");
+        bail!("No Claude history found for this workspace");
     }
 
     let mut sessions = collect_sessions(&project_dir)?;
@@ -90,13 +106,152 @@ fn run() -> Result<()> {
     print_session(&session.path, cli.include_bash_output)
 }
 
-fn claude_project_dir(cwd: &Path) -> Result<PathBuf> {
-    let project_id = cwd.to_string_lossy().replace('/', "-");
+fn resolve_workspace_dir(workspace: Option<&Option<PathBuf>>) -> Result<PathBuf> {
+    match workspace {
+        Some(Some(path)) => path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve workspace path {}", path.display())),
+        Some(None) => choose_workspace(),
+        None => std::env::current_dir().context("failed to determine current directory"),
+    }
+}
+
+fn choose_workspace() -> Result<PathBuf> {
+    let workspaces = collect_workspaces(&claude_projects_dir()?)?;
+    if workspaces.is_empty() {
+        bail!("No Claude workspaces found.");
+    }
+
+    let entries = workspaces
+        .iter()
+        .map(|workspace| {
+            format!(
+                "({}) {}",
+                workspace.modified_at.format("%Y-%m-%d %H:%M:%S"),
+                workspace.path.display()
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select a workspace")
+        .items(&entries)
+        .default(0)
+        .interact_opt()
+        .context("failed to read terminal selection")?;
+
+    match selection {
+        Some(index) => Ok(workspaces[index].path.clone()),
+        None => process::exit(0),
+    }
+}
+
+fn claude_projects_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is not set")?;
-    Ok(Path::new(&home)
-        .join(".claude")
-        .join("projects")
-        .join(project_id))
+    Ok(Path::new(&home).join(".claude").join("projects"))
+}
+
+fn claude_project_dir(workspace_dir: &Path) -> Result<PathBuf> {
+    Ok(claude_project_dir_in_projects(
+        workspace_dir,
+        &claude_projects_dir()?,
+    ))
+}
+
+fn claude_project_dir_in_projects(workspace_dir: &Path, projects_dir: &Path) -> PathBuf {
+    let project_id = workspace_dir.to_string_lossy().replace('/', "-");
+    projects_dir.join(project_id)
+}
+
+fn collect_workspaces(projects_dir: &Path) -> Result<Vec<WorkspaceSummary>> {
+    let mut workspaces = Vec::new();
+
+    for entry in projects_dir
+        .read_dir()
+        .with_context(|| format!("failed to read {}", projects_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+
+        if !path.is_dir() {
+            continue;
+        }
+
+        if let Some(workspace) = workspace_summary(&path)? {
+            workspaces.push(workspace);
+        }
+    }
+
+    workspaces.sort_by_key(|workspace| Reverse(workspace.modified_at));
+    Ok(workspaces)
+}
+
+fn workspace_summary(project_dir: &Path) -> Result<Option<WorkspaceSummary>> {
+    let latest_session = latest_session_path(project_dir)?;
+    let Some((path, modified_at)) = latest_session else {
+        return Ok(None);
+    };
+
+    let Some(workspace_path) = workspace_path_from_session(&path)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(WorkspaceSummary {
+        path: workspace_path,
+        modified_at,
+    }))
+}
+
+fn latest_session_path(project_dir: &Path) -> Result<Option<(PathBuf, DateTime<Local>)>> {
+    let mut latest = None;
+
+    for entry in project_dir
+        .read_dir()
+        .with_context(|| format!("failed to read {}", project_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+
+        let modified_at: DateTime<Local> = DateTime::from(
+            path.metadata()
+                .with_context(|| format!("failed to read metadata for {}", path.display()))?
+                .modified()
+                .with_context(|| format!("failed to read mtime for {}", path.display()))?,
+        );
+
+        if latest
+            .as_ref()
+            .is_none_or(|(_, latest_modified_at)| modified_at > *latest_modified_at)
+        {
+            latest = Some((path, modified_at));
+        }
+    }
+
+    Ok(latest)
+}
+
+fn workspace_path_from_session(path: &Path) -> Result<Option<PathBuf>> {
+    let reader = open_jsonl(path)?;
+
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("failed to read {}", path.display()))?;
+        let data: Value = serde_json::from_str(&line)
+            .with_context(|| format!("failed to parse JSON in {}", path.display()))?;
+
+        if let Some(cwd) = session_cwd(&data) {
+            return Ok(Some(PathBuf::from(cwd)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn session_cwd(data: &Value) -> Option<&str> {
+    data.get("cwd").and_then(Value::as_str)
 }
 
 fn collect_sessions(project_dir: &Path) -> Result<Vec<SessionSummary>> {
@@ -377,11 +532,13 @@ fn quote_markdown(text: &str, use_color: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSI_BOLD_BLUE, ANSI_DIM, ANSI_RESET, Cli, collapse_newlines, format_speaker_heading,
-        format_timestamp, is_message, message_content, quote_markdown,
+        ANSI_BOLD_BLUE, ANSI_DIM, ANSI_RESET, Cli, claude_project_dir_in_projects,
+        collapse_newlines, format_speaker_heading, format_timestamp, is_message, message_content,
+        quote_markdown, session_cwd,
     };
     use clap::{Parser, error::ErrorKind};
     use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn extracts_string_message_content() {
@@ -495,5 +652,49 @@ mod tests {
         let error = Cli::try_parse_from(["claude-history", "--version"]).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn parses_workspace_flag() {
+        let cli = Cli::try_parse_from(["claude-history", "--workspace", "/tmp/example"]).unwrap();
+
+        assert_eq!(
+            cli.workspace
+                .as_ref()
+                .and_then(|workspace| workspace.as_deref()),
+            Some(Path::new("/tmp/example"))
+        );
+    }
+
+    #[test]
+    fn parses_workspace_flag_without_value() {
+        let cli = Cli::try_parse_from(["claude-history", "-w"]).unwrap();
+
+        assert_eq!(cli.workspace, Some(None));
+    }
+
+    #[test]
+    fn builds_claude_project_dir_from_workspace_path() {
+        let project_dir = claude_project_dir_in_projects(
+            Path::new("/tmp/example"),
+            Path::new("/tmp/home/.claude/projects"),
+        );
+
+        assert_eq!(
+            project_dir,
+            Path::new("/tmp/home/.claude/projects/-tmp-example")
+        );
+    }
+
+    #[test]
+    fn extracts_workspace_path_from_session_record() {
+        let value = json!({
+            "cwd": "/tmp/example",
+            "message": {
+                "content": "hello"
+            }
+        });
+
+        assert_eq!(session_cwd(&value), Some("/tmp/example"));
     }
 }
