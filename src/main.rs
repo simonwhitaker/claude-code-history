@@ -27,13 +27,25 @@ const ANSI_DIM: &str = "\x1b[2m";
     about = "Get the history of conversations with Claude Code."
 )]
 struct Cli {
-    #[arg(short = 'b', long = "include-bash-output")]
+    #[arg(
+        short = 'b',
+        long = "include-bash-output",
+        help = "Include bash stdout entries in session output"
+    )]
     include_bash_output: bool,
 
-    #[arg(short = 'l', long = "list")]
+    #[arg(
+        short = 'l',
+        long = "list",
+        help = "List recent sessions without printing a transcript"
+    )]
     list: bool,
 
-    #[arg(short = 's', long = "choose-session")]
+    #[arg(
+        short = 's',
+        long = "choose-session",
+        help = "Choose which recent session to display"
+    )]
     choose_session: bool,
 }
 
