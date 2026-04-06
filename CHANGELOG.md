@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/simonwhitaker/claude-code-history/compare/v0.1.9...v0.1.10) - 2026-04-06
+
+### Other
+
+- update deps ([#24](https://github.com/simonwhitaker/claude-code-history/pull/24))
+
 ## [0.1.9](https://github.com/simonwhitaker/claude-code-history/compare/v0.1.8...v0.1.9) - 2026-04-06
 
 ### Added
