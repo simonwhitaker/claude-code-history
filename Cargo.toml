@@ -2,7 +2,7 @@
 name = "claude-code-history"
 version = "0.1.8"
 edition = "2024"
-description = "Print the most recent Claude Code session for the current directory."
+description = "Print the most recent Claude Code session for the current or selected workspace."
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/simonwhitaker/claude-code-history"
