@@ -6,6 +6,16 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/simonwhitaker/claude-code-history/compare/v0.1.8...v0.1.9) - 2026-04-06
+
+### Added
+
+- add workspace selection ([#22](https://github.com/simonwhitaker/claude-code-history/pull/22))
+
+### Fixed
+
+- add help text for session flags ([#21](https://github.com/simonwhitaker/claude-code-history/pull/21))
+
 ## [0.1.8](https://github.com/simonwhitaker/claude-code-history/compare/v0.1.7...v0.1.8) - 2026-03-20
 
 ### Other
